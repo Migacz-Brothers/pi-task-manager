@@ -1,0 +1,4 @@
+{"type":"task_started"}
+{"type":"activity","text":"I'll add the helper and a test."}
+{"type":"tool_use","tool":"Edit","input":{"path":"src/util.ts"}}
+{"type":"final_result","status":"passed","summary":"Added the helper; tests should pass."}

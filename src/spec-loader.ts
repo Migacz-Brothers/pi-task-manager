@@ -100,6 +100,7 @@ export function loadTaskSpec(taskDir: string): TaskSpec {
     slug: data.slug,
     branch: data.branch,
     image: typeof data.image === 'string' ? data.image : undefined,
+    harness: typeof data.harness === 'string' ? data.harness : undefined,
     subtasks,
     dir: taskDir,
   };

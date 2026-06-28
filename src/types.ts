@@ -42,6 +42,11 @@ export interface TaskSpec {
   slug: string;
   branch: string;
   image?: string;
+  /**
+   * Which agent harness runs this task's subtasks (`pi` | `claude`). Optional;
+   * the engine falls back to the default harness (pi) when unset or unknown.
+   */
+  harness?: string;
   subtasks: SubtaskSpec[];
   dir: string;
 }

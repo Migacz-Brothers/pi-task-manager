@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","cwd":"/work","session_id":"abc-123","tools":["Edit","Bash","Read"],"model":"claude-opus-4-8","permissionMode":"bypassPermissions"}
+{"type":"assistant","message":{"id":"msg_01","role":"assistant","model":"claude-opus-4-8","content":[{"type":"text","text":"I'll add the helper and a test."}]},"session_id":"abc-123"}
+{"type":"assistant","message":{"id":"msg_02","role":"assistant","model":"claude-opus-4-8","content":[{"type":"tool_use","id":"toolu_01","name":"Edit","input":{"path":"src/util.ts"}}]},"session_id":"abc-123"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"File edited."}]},"session_id":"abc-123"}
+{"type":"result","subtype":"success","is_error":false,"result":"Added the helper; tests should pass.","session_id":"abc-123","duration_ms":4210,"num_turns":2,"total_cost_usd":0.0123}

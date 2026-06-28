@@ -4,8 +4,8 @@ import { mkdirSync } from 'fs';
 import type { TaskSpec, SubtaskSpec, SubtaskStatus, FinalResult, FinalStatus, HarnessEvent } from './types.ts';
 import { schedule } from './scheduler.ts';
 import { TaskRepository, SubtaskRepository, CommandRepository, EventRepository } from './infra/db/index.ts';
-import { runPiHarness } from './harness-adapter.ts';
-import type { ExecResult } from './harness-adapter.ts';
+import type { ExecResult, HarnessRunner } from './harness-adapter.ts';
+import { selectHarness } from './harness-registry.ts';
 import { assembleRetryPrompt } from './context-assembler.ts';
 import {
   startContainer,
@@ -128,6 +128,11 @@ export interface EngineOptions {
   apiKey: string;
   db: Database;
   deps?: EngineDeps;
+  /**
+   * Run-level harness override (`pi` | `claude`). The task's own frontmatter
+   * `harness:` field takes precedence; both fall back to the default (pi).
+   */
+  harness?: string;
   /** Per-attempt wall-clock timeout; defaults to {@link ATTEMPT_TIMEOUT_MS} (overridable for tests). */
   attemptTimeoutMs?: number;
   /**
@@ -148,6 +153,7 @@ async function runAttempt(
   apiKey: string,
   timeoutMs: number,
   deps: EngineDeps,
+  runHarness: HarnessRunner,
   onEvent?: (ev: HarnessEvent) => void
 ): Promise<FinalResult> {
   const controller = new AbortController();
@@ -161,7 +167,7 @@ async function runAttempt(
   });
 
   try {
-    const run = runPiHarness(
+    const run = runHarness(
       containerId,
       prompt,
       apiKey,
@@ -193,6 +199,10 @@ export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void
   const deps = opts.deps ?? defaultDeps;
   const attemptTimeoutMs = opts.attemptTimeoutMs ?? ATTEMPT_TIMEOUT_MS;
   const worktreesDir = opts.worktreesDir ?? join(repoPath, '.specs', '.state', 'worktrees');
+  // Harness selection happens once per task: frontmatter wins, then the run-level
+  // override, then the default (pi). Everything downstream — scheduler, verify,
+  // commit/retry — is identical regardless of which runner this resolves to.
+  const runHarness = selectHarness(task.harness, opts.harness);
   const taskRepo = new TaskRepository(db);
   const subtaskRepo = new SubtaskRepository(db);
   const commandRepo = new CommandRepository(db);
@@ -401,7 +411,7 @@ export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void
         subtaskRepo.setActivity(subtaskId, oneLine(line), 'agent');
       };
 
-      const harnessResult = await runAttempt(cid, prompt, apiKey, attemptTimeoutMs, deps, onEvent);
+      const harnessResult = await runAttempt(cid, prompt, apiKey, attemptTimeoutMs, deps, runHarness, onEvent);
 
       // Classify the attempt. A harness crash/timeout short-circuits; otherwise
       // the verify is authoritative — a self-reported success never overrides a
