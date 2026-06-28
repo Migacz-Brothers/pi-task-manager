@@ -1,0 +1,4 @@
+node_modules/
+.specs/.state/
+dist/
+*.db
