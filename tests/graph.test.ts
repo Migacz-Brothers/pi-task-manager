@@ -222,7 +222,8 @@ function makeRig(harnessByBody: Record<string, FinalResult> = {}): FakeRig {
   const harnessBodies: string[] = [];
 
   const deps: EngineDeps = {
-    ensureBranch: async () => {},
+    createWorktree: async () => {},
+    removeWorktree: async () => {},
     startContainer: async () => 'fake-container',
     stopContainer: async () => {},
     commitAll: async (_repo, message) => {

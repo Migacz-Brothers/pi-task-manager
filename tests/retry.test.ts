@@ -78,7 +78,8 @@ function makeRig(cfg: RigCfg = {}) {
   let fragment: string | undefined;
 
   const deps: EngineDeps = {
-    ensureBranch: async () => {},
+    createWorktree: async () => {},
+    removeWorktree: async () => {},
     startContainer: async () => 'fake-container',
     stopContainer: async () => {},
     commitAll: async (_repo, message) => {

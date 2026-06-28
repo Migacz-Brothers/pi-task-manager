@@ -1,3 +1,5 @@
+import { resolve } from 'path';
+
 interface GitResult {
   exitCode: number;
   stdout: string;
@@ -19,18 +21,67 @@ async function git(args: string[], cwd: string): Promise<GitResult> {
   return { exitCode: proc.exitCode ?? 1, stdout: stdout.trim(), stderr: stderr.trim() };
 }
 
-export async function ensureBranch(repoPath: string, branch: string): Promise<void> {
-  const exists = await git(['rev-parse', '--verify', branch], repoPath);
-  if (exists.exitCode !== 0) {
-    const result = await git(['checkout', '-b', branch], repoPath);
-    if (result.exitCode !== 0) {
-      throw new Error(`Failed to create branch '${branch}': ${result.stderr}`);
-    }
-  } else {
-    const result = await git(['checkout', branch], repoPath);
-    if (result.exitCode !== 0) {
-      throw new Error(`Failed to checkout branch '${branch}': ${result.stderr}`);
-    }
+/** True if `git worktree list --porcelain` output already registers `worktreePath`. */
+function worktreeRegistered(porcelain: string, worktreePath: string): boolean {
+  const target = resolve(worktreePath);
+  return porcelain
+    .split('\n')
+    .filter(line => line.startsWith('worktree '))
+    .map(line => resolve(line.slice('worktree '.length).trim()))
+    .includes(target);
+}
+
+/**
+ * Create a git worktree at `worktreePath` checked out on `branch`, isolating the
+ * task's work from the main checkout and from sibling tasks. All worktrees share
+ * the main repo's `.git` object store, so commits made here are durable
+ * independent of whether the worktree directory survives.
+ *
+ * Edge cases (documented behavior):
+ * - **Branch already exists** → reuse it (check it out into the new worktree)
+ *   rather than erroring; the task's commits simply continue that branch.
+ * - **Stale worktree from a prior crashed run** → reconcile: `prune` clears
+ *   metadata for vanished directories, and a worktree still registered at the
+ *   target path is reused as-is (overlaps with slice 08 reconciliation).
+ */
+export async function createWorktree(
+  repoPath: string,
+  branch: string,
+  worktreePath: string
+): Promise<void> {
+  // Drop administrative metadata for worktrees whose directory has disappeared,
+  // so re-adding at the same path doesn't trip over a stale registration.
+  await git(['worktree', 'prune'], repoPath);
+
+  // A worktree still registered at this path (a prior run that didn't clean up)
+  // is reused — isolation is intact and its branch checkout is already correct.
+  const listed = await git(['worktree', 'list', '--porcelain'], repoPath);
+  if (worktreeRegistered(listed.stdout, worktreePath)) return;
+
+  const branchExists =
+    (await git(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], repoPath)).exitCode === 0;
+
+  const args = branchExists
+    ? ['worktree', 'add', worktreePath, branch]
+    : ['worktree', 'add', '-b', branch, worktreePath];
+
+  const result = await git(args, repoPath);
+  if (result.exitCode !== 0) {
+    throw new Error(`Failed to create worktree for branch '${branch}': ${result.stderr}`);
+  }
+}
+
+/**
+ * Remove the worktree at `worktreePath`, **keeping the branch**. Because every
+ * worktree shares the main repo's `.git`, the branch and all its commits live on
+ * after the directory is gone — this is what makes the success-cleanup rule
+ * (remove worktree, keep branch) lossless. `--force` is needed because the
+ * worktree holds a live checkout (and possibly untracked files).
+ */
+export async function removeWorktree(repoPath: string, worktreePath: string): Promise<void> {
+  const result = await git(['worktree', 'remove', '--force', worktreePath], repoPath);
+  if (result.exitCode !== 0) {
+    throw new Error(`Failed to remove worktree at '${worktreePath}': ${result.stderr}`);
   }
 }
 

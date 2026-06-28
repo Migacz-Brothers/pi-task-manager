@@ -1,4 +1,6 @@
 import type { Database } from 'bun:sqlite';
+import { join } from 'path';
+import { mkdirSync } from 'fs';
 import type { TaskSpec, SubtaskStatus, FinalResult, FinalStatus } from './types.ts';
 import { schedule } from './scheduler.ts';
 import { TaskRepository, SubtaskRepository } from './infra/db/index.ts';
@@ -10,7 +12,7 @@ import {
   execInContainer,
   stopContainer,
 } from './infra/container-manager.ts';
-import { ensureBranch, commitAll, diffChanges } from './infra/git-manager.ts';
+import { createWorktree, removeWorktree, commitAll, diffChanges } from './infra/git-manager.ts';
 
 const DEFAULT_IMAGE = 'ubuntu:22.04';
 
@@ -33,7 +35,8 @@ const FRAGMENT_PATH = '.orchestrator/handoff.md';
  * repo; defaults to the real implementations.
  */
 export interface EngineDeps {
-  ensureBranch(repoPath: string, branch: string): Promise<void>;
+  createWorktree(repoPath: string, branch: string, worktreePath: string): Promise<void>;
+  removeWorktree(repoPath: string, worktreePath: string): Promise<void>;
   startContainer(
     image: string,
     repoPath: string,
@@ -53,7 +56,8 @@ export interface EngineDeps {
 }
 
 const defaultDeps: EngineDeps = {
-  ensureBranch,
+  createWorktree,
+  removeWorktree,
   startContainer,
   execInContainer,
   stopContainer,
@@ -68,6 +72,11 @@ export interface EngineOptions {
   deps?: EngineDeps;
   /** Per-attempt wall-clock timeout; defaults to {@link ATTEMPT_TIMEOUT_MS} (overridable for tests). */
   attemptTimeoutMs?: number;
+  /**
+   * Base directory under which each task gets its own `<slug>` worktree. Defaults
+   * to the gitignored state dir so worktrees never dirty the tracked tree.
+   */
+  worktreesDir?: string;
 }
 
 /**
@@ -122,6 +131,7 @@ export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void
   const { repoPath, apiKey, db } = opts;
   const deps = opts.deps ?? defaultDeps;
   const attemptTimeoutMs = opts.attemptTimeoutMs ?? ATTEMPT_TIMEOUT_MS;
+  const worktreesDir = opts.worktreesDir ?? join(repoPath, '.specs', '.state', 'worktrees');
   const taskRepo = new TaskRepository(db);
   const subtaskRepo = new SubtaskRepository(db);
 
@@ -134,14 +144,21 @@ export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void
   }
   subtaskRepo.deleteOrphans(taskId, task.subtasks.map(s => s.slug));
 
-  await deps.ensureBranch(repoPath, task.branch);
+  // Each task runs on its own worktree + branch (named from frontmatter). All git
+  // operations — commit-per-subtask, diffs for retry context — target the
+  // worktree, never the main checkout, so parallel tasks never clobber each other.
+  const worktreePath = join(worktreesDir, task.slug);
+  mkdirSync(worktreesDir, { recursive: true });
+  await deps.createWorktree(repoPath, task.branch, worktreePath);
 
   const image = task.image ?? DEFAULT_IMAGE;
   const containerLabel = `pi-task-manager.task=${task.slug}`;
 
   let containerId: string;
   try {
-    containerId = await deps.startContainer(image, repoPath, containerLabel, {
+    // Bind the container to the worktree (not the repo root): the agent edits
+    // files in the isolated checkout, and its commits land on the task branch.
+    containerId = await deps.startContainer(image, worktreePath, containerLabel, {
       PI_API_KEY: apiKey,
     });
   } catch (err) {
@@ -162,10 +179,13 @@ export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void
     return m;
   };
 
+  // Cleanup disposition: only a clean, fully-completed run removes the worktree
+  // (keeping the branch). A halt → needs_human, an abort, or a thrown error all
+  // leave the worktree in place for inspection.
+  let succeeded = false;
   try {
-    // A failure (with no retry yet — that is 04) halts the task: we stop pulling
-    // new runnable work but still apply the cascade so dependents end `blocked`
-    // rather than silently `pending`.
+    // A failure halts the task: we stop pulling new runnable work but still apply
+    // the cascade so dependents end `blocked` rather than silently `pending`.
     let halted = false;
 
     while (true) {
@@ -220,7 +240,7 @@ export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void
           // One commit per passing subtask. The message encodes task + subtask
           // slug so the branch history is self-describing and the engine can
           // later recognize its own checkpoints.
-          await deps.commitAll(repoPath, `${task.slug}(${subtask.slug}): passed`);
+          await deps.commitAll(worktreePath, `${task.slug}(${subtask.slug}): passed`);
           subtaskRepo.setStatus(subtaskId, 'passed');
           console.log(`  [${subtask.slug}] passed (attempt ${attempt}/${MAX_ATTEMPTS})`);
           passed = true;
@@ -237,7 +257,7 @@ export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void
         await clearFragment(containerId, deps);
 
         if (attempt < MAX_ATTEMPTS) {
-          const diff = await deps.diffChanges(repoPath);
+          const diff = await deps.diffChanges(worktreePath);
           prompt = assembleRetryPrompt({
             body: subtask.body,
             attempt: attempt + 1,
@@ -258,7 +278,17 @@ export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void
         continue;
       }
     }
+
+    // Reached only when the loop drains all runnable work without halting: every
+    // subtask passed. This is the sole path that earns worktree teardown.
+    succeeded = !halted;
   } finally {
     await deps.stopContainer(containerId);
+
+    // Success → remove the worktree, keep the branch (commits survive in the
+    // shared object store). Any non-success exit keeps both for inspection.
+    if (succeeded) {
+      await deps.removeWorktree(repoPath, worktreePath);
+    }
   }
 }
