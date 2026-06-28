@@ -13,8 +13,7 @@ import {
   stopContainer,
 } from './infra/container-manager.ts';
 import { createWorktree, removeWorktree, commitAll, diffChanges } from './infra/git-manager.ts';
-
-const DEFAULT_IMAGE = 'ubuntu:22.04';
+import { buildTaskImage } from './infra/image-resolver.ts';
 
 /**
  * Retry policy constants — script-level, deliberately not frontmatter fields so
@@ -37,6 +36,11 @@ const FRAGMENT_PATH = '.orchestrator/handoff.md';
 export interface EngineDeps {
   createWorktree(repoPath: string, branch: string, worktreePath: string): Promise<void>;
   removeWorktree(repoPath: string, worktreePath: string): Promise<void>;
+  /**
+   * Resolve (and build) the concrete image the task runs in: the repo's dev
+   * container or the frontmatter `image:` override, with the harness layered on.
+   */
+  resolveImage(repoPath: string, override: string | undefined, slug: string): Promise<string>;
   startContainer(
     image: string,
     repoPath: string,
@@ -58,6 +62,7 @@ export interface EngineDeps {
 const defaultDeps: EngineDeps = {
   createWorktree,
   removeWorktree,
+  resolveImage: buildTaskImage,
   startContainer,
   execInContainer,
   stopContainer,
@@ -151,16 +156,30 @@ export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void
   mkdirSync(worktreesDir, { recursive: true });
   await deps.createWorktree(repoPath, task.branch, worktreePath);
 
-  const image = task.image ?? DEFAULT_IMAGE;
+  // Image = the repo's dev container (or the frontmatter `image:` override) with
+  // the harness layered on. Resolved against the worktree so it reflects the
+  // task branch's toolchain. A config error here (no dev container, no override)
+  // fails the task before any container starts, leaving the worktree for
+  // inspection.
+  let image: string;
+  try {
+    image = await deps.resolveImage(worktreePath, task.image, task.slug);
+  } catch (err) {
+    throw new Error(
+      `Image resolution failed for task '${task.slug}': ${err instanceof Error ? err.message : err}`
+    );
+  }
+
+  // Label by task slug so slice 08's orphan-kill can find this container later.
   const containerLabel = `pi-task-manager.task=${task.slug}`;
 
   let containerId: string;
   try {
     // Bind the container to the worktree (not the repo root): the agent edits
     // files in the isolated checkout, and its commits land on the task branch.
-    containerId = await deps.startContainer(image, worktreePath, containerLabel, {
-      PI_API_KEY: apiKey,
-    });
+    // No secrets at start time — the API key is injected at `docker exec` time
+    // (see harness-adapter), so it never lives in the container's run config.
+    containerId = await deps.startContainer(image, worktreePath, containerLabel, {});
   } catch (err) {
     throw new Error(`Container failed to start for task '${task.slug}': ${err}`);
   }

@@ -201,6 +201,7 @@ function makeRig(harnessByBody: Record<string, FinalResult> = {}): FakeRig {
   const deps: EngineDeps = {
     createWorktree: async () => {},
     removeWorktree: async () => {},
+    resolveImage: async () => 'fake-image',
     startContainer: async () => {
       counts.started++;
       return 'fake-container';

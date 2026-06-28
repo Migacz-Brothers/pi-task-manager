@@ -3,6 +3,7 @@ import { readdirSync, statSync, mkdirSync } from 'fs';
 import { loadTaskSpec } from './spec-loader.ts';
 import { openDb } from './infra/db/index.ts';
 import { runTask } from './engine.ts';
+import { resolveApiKey, AuthError } from './infra/auth.ts';
 
 async function main(): Promise<void> {
   const repoPath = process.cwd();
@@ -13,10 +14,17 @@ async function main(): Promise<void> {
 
   const db = openDb(join(stateDir, 'engine.db'));
 
-  const apiKey = process.env.PI_API_KEY ?? process.env.ANTHROPIC_API_KEY ?? '';
-  if (!apiKey) {
-    console.error('Error: PI_API_KEY or ANTHROPIC_API_KEY environment variable is required');
-    process.exit(1);
+  // Fail fast on a missing credential — clearer here than as a confusing agent
+  // error mid-run. Sourced from host env or a gitignored secrets file.
+  let apiKey: string;
+  try {
+    apiKey = resolveApiKey(repoPath);
+  } catch (err) {
+    if (err instanceof AuthError) {
+      console.error(`Error: ${err.message}`);
+      process.exit(1);
+    }
+    throw err;
   }
 
   let entries: string[];

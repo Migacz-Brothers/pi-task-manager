@@ -154,6 +154,7 @@ function makeRig(harnessByBody: Record<string, FinalResult> = {}): IsoRig {
     removeWorktree: async (_repoPath, worktreePath) => {
       removed.push(worktreePath);
     },
+    resolveImage: async () => 'fake-image',
     startContainer: async (_image, repoPath) => {
       boundPaths.push(repoPath); // engine binds the worktree path here
       return 'fake-container';

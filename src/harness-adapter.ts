@@ -14,6 +14,23 @@ export type ExecFn = (
   signal?: AbortSignal
 ) => Promise<ExecResult>;
 
+/**
+ * Full tool auto-approval. The container + branch + tests are the safety net, so
+ * the agent runs every tool without per-call permission prompts — the run is
+ * fully autonomous.
+ */
+const AUTO_APPROVE_FLAG = '--auto-approve';
+
+/**
+ * Instruct-only git boundary (v1): the engine owns all git operations and the
+ * agent only edits files. Passed as a system-prompt instruction; enforcement is
+ * by instruction for now (the engine still drives every commit itself).
+ */
+export const ENGINE_OWNS_GIT_INSTRUCTION =
+  'The orchestration engine owns all git operations — branching, staging, committing, and ' +
+  'worktrees. Do NOT run any git commands. Only create and edit files; the engine commits ' +
+  'your changes itself after its checks pass.';
+
 function toFinalStatus(s: unknown): FinalStatus {
   if (s === 'passed' || s === 'verify_failed' || s === 'harness_error') return s;
   return 'harness_error';
@@ -85,7 +102,8 @@ export async function runPiHarness(
   try {
     execResult = await execFn(
       containerId,
-      ['pi', '--mode', 'json'],
+      ['pi', '--mode', 'json', AUTO_APPROVE_FLAG, '--append-system-prompt', ENGINE_OWNS_GIT_INSTRUCTION],
+      // Auth injected at exec time only — never baked into the image or committed.
       { PI_API_KEY: apiKey },
       prompt,
       signal
