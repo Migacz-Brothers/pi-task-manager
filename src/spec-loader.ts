@@ -35,9 +35,12 @@ export function loadTaskSpec(taskDir: string): TaskSpec {
 
   let files: string[];
   try {
+    // Subtasks run in `NN-` order. A plain lexical sort of the full filename
+    // orders by the two-digit prefix first and then breaks ties (duplicate
+    // prefixes, e.g. `01-a.md` vs `01-b.md`) deterministically by filename.
     files = readdirSync(taskDir)
       .filter(f => /^\d{2}-.*\.md$/.test(f))
-      .sort();
+      .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   } catch {
     throw new SpecLoadError(`Cannot read directory ${taskDir}`);
   }

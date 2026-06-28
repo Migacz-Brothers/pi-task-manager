@@ -14,11 +14,24 @@ export interface SubtaskRow {
 export class SubtaskRepository {
   constructor(private readonly db: Database) {}
 
+  /**
+   * Upsert a subtask definition keyed by (task_id, slug).
+   *
+   * Frontmatter is read-only to the engine, so the source of truth for a
+   * subtask's definition is its file. When the file's content hash drifts from
+   * what we stored, the definition changed underneath us: we re-seed by resetting
+   * status to 'pending' and attempts to 0 so the subtask runs again. An unchanged
+   * hash preserves prior run state (e.g. a 'passed' subtask stays passed).
+   */
   upsert(taskId: number, slug: string, verify: string, contentHash: string): number {
     this.db.run(
       `INSERT INTO subtasks (task_id, slug, verify, content_hash) VALUES (?, ?, ?, ?)
        ON CONFLICT(task_id, slug) DO UPDATE SET
          verify       = excluded.verify,
+         status       = CASE WHEN subtasks.content_hash <> excluded.content_hash
+                             THEN 'pending' ELSE subtasks.status END,
+         attempts     = CASE WHEN subtasks.content_hash <> excluded.content_hash
+                             THEN 0 ELSE subtasks.attempts END,
          content_hash = excluded.content_hash,
          updated_at   = unixepoch()`,
       [taskId, slug, verify, contentHash]
@@ -27,6 +40,22 @@ export class SubtaskRepository {
       .query('SELECT id FROM subtasks WHERE task_id = ? AND slug = ?')
       .get(taskId, slug) as { id: number };
     return row.id;
+  }
+
+  /**
+   * Drop subtask rows for this task whose slug is not in `keepSlugs`, reconciling
+   * the store with subtask files that were removed between runs. Returns the
+   * number of rows pruned.
+   */
+  deleteOrphans(taskId: number, keepSlugs: string[]): number {
+    if (keepSlugs.length === 0) {
+      return this.db.run('DELETE FROM subtasks WHERE task_id = ?', [taskId]).changes;
+    }
+    const placeholders = keepSlugs.map(() => '?').join(', ');
+    return this.db.run(
+      `DELETE FROM subtasks WHERE task_id = ? AND slug NOT IN (${placeholders})`,
+      [taskId, ...keepSlugs]
+    ).changes;
   }
 
   findId(taskId: number, slug: string): number {
