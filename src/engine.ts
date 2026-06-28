@@ -1,11 +1,6 @@
 import type { Database } from 'bun:sqlite';
 import type { TaskSpec } from './types.ts';
-import {
-  upsertTask,
-  upsertSubtask,
-  setSubtaskStatus,
-  incrementAttempts,
-} from './state-store.ts';
+import { TaskRepository, SubtaskRepository } from './db/index.ts';
 import { runPiHarness } from './harness-adapter.ts';
 import {
   startContainer,
@@ -24,10 +19,12 @@ export interface EngineOptions {
 
 export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void> {
   const { repoPath, apiKey, db } = opts;
+  const taskRepo = new TaskRepository(db);
+  const subtaskRepo = new SubtaskRepository(db);
 
-  const taskId = upsertTask(db, task.slug, task.branch);
+  const taskId = taskRepo.upsert(task.slug, task.branch);
   for (const subtask of task.subtasks) {
-    upsertSubtask(db, taskId, subtask.slug, subtask.verify, subtask.contentHash);
+    subtaskRepo.upsert(taskId, subtask.slug, subtask.verify, subtask.contentHash);
   }
 
   await ensureBranch(repoPath, task.branch);
@@ -44,13 +41,10 @@ export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void
 
   try {
     for (const subtask of task.subtasks) {
-      const row = db
-        .query('SELECT id FROM subtasks WHERE task_id = ? AND slug = ?')
-        .get(taskId, subtask.slug) as { id: number };
-      const subtaskId = row.id;
+      const subtaskId = subtaskRepo.findId(taskId, subtask.slug);
 
-      setSubtaskStatus(db, subtaskId, 'running');
-      incrementAttempts(db, subtaskId);
+      subtaskRepo.setStatus(subtaskId, 'running');
+      subtaskRepo.incrementAttempts(subtaskId);
 
       const finalResult = await runPiHarness(
         containerId,
@@ -60,16 +54,15 @@ export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void
       );
 
       if (finalResult.status !== 'passed') {
-        setSubtaskStatus(db, subtaskId, finalResult.status);
+        subtaskRepo.setStatus(subtaskId, finalResult.status);
         console.log(`  [${subtask.slug}] ${finalResult.status}: ${finalResult.summary}`);
         continue;
       }
 
-      // Verify inside the container
       const verifyResult = await execInContainer(containerId, ['sh', '-c', subtask.verify]);
 
       if (verifyResult.exitCode !== 0) {
-        setSubtaskStatus(db, subtaskId, 'verify_failed');
+        subtaskRepo.setStatus(subtaskId, 'verify_failed');
         console.log(`  [${subtask.slug}] verify_failed`);
         if (verifyResult.stdout) console.log(verifyResult.stdout);
         if (verifyResult.stderr) console.log(verifyResult.stderr);
@@ -77,7 +70,7 @@ export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void
       }
 
       await commitAll(repoPath, `${task.slug}(${subtask.slug}): passed`);
-      setSubtaskStatus(db, subtaskId, 'passed');
+      subtaskRepo.setStatus(subtaskId, 'passed');
       console.log(`  [${subtask.slug}] passed`);
     }
   } finally {

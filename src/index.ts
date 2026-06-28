@@ -1,7 +1,7 @@
 import { join } from 'path';
 import { readdirSync, statSync, mkdirSync } from 'fs';
 import { loadTaskSpec } from './spec-loader.ts';
-import { openDb } from './state-store.ts';
+import { openDb } from './db/index.ts';
 import { runTask } from './engine.ts';
 
 async function main(): Promise<void> {

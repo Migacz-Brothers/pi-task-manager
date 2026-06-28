@@ -3,13 +3,7 @@ import { join } from 'path';
 import { mkdirSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { loadTaskSpec, SpecLoadError } from '../src/spec-loader.ts';
-import {
-  openDb,
-  upsertTask,
-  upsertSubtask,
-  setSubtaskStatus,
-  getSubtaskStatus,
-} from '../src/state-store.ts';
+import { openDb, TaskRepository, SubtaskRepository } from '../src/db/index.ts';
 import { parseEventStream } from '../src/harness-adapter.ts';
 
 // ── Spec Loader ───────────────────────────────────────────────────────────────
@@ -275,9 +269,9 @@ blockedBy:
   });
 });
 
-// ── State Store ───────────────────────────────────────────────────────────────
+// ── DB Repositories ───────────────────────────────────────────────────────────
 
-describe('skeleton: state-store', () => {
+describe('skeleton: db', () => {
   let dbPath: string;
 
   beforeEach(() => {
@@ -307,56 +301,110 @@ describe('skeleton: state-store', () => {
     expect(() => openDb(dbPath)).not.toThrow();
   });
 
-  test('upsertTask returns a positive integer id', () => {
+  test('TaskRepository.upsert returns a positive integer id', () => {
     const db = openDb(dbPath);
-    const id = upsertTask(db, 'task-a', 'feat/a');
+    const tasks = new TaskRepository(db);
+    const id = tasks.upsert('task-a', 'feat/a');
     expect(id).toBeGreaterThan(0);
     db.close();
   });
 
-  test('upsertTask is idempotent', () => {
+  test('TaskRepository.upsert is idempotent', () => {
     const db = openDb(dbPath);
-    const id1 = upsertTask(db, 'task-a', 'feat/a');
-    const id2 = upsertTask(db, 'task-a', 'feat/a');
+    const tasks = new TaskRepository(db);
+    const id1 = tasks.upsert('task-a', 'feat/a');
+    const id2 = tasks.upsert('task-a', 'feat/a');
     expect(id1).toBe(id2);
     db.close();
   });
 
-  test('upsertSubtask returns a positive integer id', () => {
+  test('TaskRepository.findById returns the inserted row', () => {
     const db = openDb(dbPath);
-    const taskId = upsertTask(db, 'task-a', 'feat/a');
-    const subtaskId = upsertSubtask(db, taskId, 'first', 'echo ok', 'abc123');
+    const tasks = new TaskRepository(db);
+    const id = tasks.upsert('task-a', 'feat/a');
+    const row = tasks.findById(id);
+    expect(row?.slug).toBe('task-a');
+    expect(row?.branch).toBe('feat/a');
+    db.close();
+  });
+
+  test('SubtaskRepository.upsert returns a positive integer id', () => {
+    const db = openDb(dbPath);
+    const tasks = new TaskRepository(db);
+    const subtasks = new SubtaskRepository(db);
+    const taskId = tasks.upsert('task-a', 'feat/a');
+    const subtaskId = subtasks.upsert(taskId, 'first', 'echo ok', 'abc123');
     expect(subtaskId).toBeGreaterThan(0);
     db.close();
   });
 
   test('new subtask defaults to pending status', () => {
     const db = openDb(dbPath);
-    const taskId = upsertTask(db, 'task-a', 'feat/a');
-    const subtaskId = upsertSubtask(db, taskId, 'first', 'echo ok', 'abc123');
-    expect(getSubtaskStatus(db, subtaskId)).toBe('pending');
+    const tasks = new TaskRepository(db);
+    const subtasks = new SubtaskRepository(db);
+    const taskId = tasks.upsert('task-a', 'feat/a');
+    const subtaskId = subtasks.upsert(taskId, 'first', 'echo ok', 'abc123');
+    expect(subtasks.getStatus(subtaskId)).toBe('pending');
     db.close();
   });
 
-  test('setSubtaskStatus persists status changes', () => {
+  test('SubtaskRepository.setStatus persists status changes', () => {
     const db = openDb(dbPath);
-    const taskId = upsertTask(db, 'task-a', 'feat/a');
-    const subtaskId = upsertSubtask(db, taskId, 'first', 'echo ok', 'abc123');
+    const tasks = new TaskRepository(db);
+    const subtasks = new SubtaskRepository(db);
+    const taskId = tasks.upsert('task-a', 'feat/a');
+    const subtaskId = subtasks.upsert(taskId, 'first', 'echo ok', 'abc123');
 
-    setSubtaskStatus(db, subtaskId, 'running');
-    expect(getSubtaskStatus(db, subtaskId)).toBe('running');
+    subtasks.setStatus(subtaskId, 'running');
+    expect(subtasks.getStatus(subtaskId)).toBe('running');
 
-    setSubtaskStatus(db, subtaskId, 'passed');
-    expect(getSubtaskStatus(db, subtaskId)).toBe('passed');
+    subtasks.setStatus(subtaskId, 'passed');
+    expect(subtasks.getStatus(subtaskId)).toBe('passed');
 
-    setSubtaskStatus(db, subtaskId, 'verify_failed');
-    expect(getSubtaskStatus(db, subtaskId)).toBe('verify_failed');
+    subtasks.setStatus(subtaskId, 'verify_failed');
+    expect(subtasks.getStatus(subtaskId)).toBe('verify_failed');
     db.close();
   });
 
-  test('getSubtaskStatus throws for unknown id', () => {
+  test('SubtaskRepository.getStatus throws for unknown id', () => {
     const db = openDb(dbPath);
-    expect(() => getSubtaskStatus(db, 99999)).toThrow();
+    const subtasks = new SubtaskRepository(db);
+    expect(() => subtasks.getStatus(99999)).toThrow();
+    db.close();
+  });
+
+  test('SubtaskRepository.findId throws when subtask not found', () => {
+    const db = openDb(dbPath);
+    const tasks = new TaskRepository(db);
+    const subtasks = new SubtaskRepository(db);
+    const taskId = tasks.upsert('task-a', 'feat/a');
+    expect(() => subtasks.findId(taskId, 'nonexistent')).toThrow();
+    db.close();
+  });
+
+  test('SubtaskRepository.findById returns row with correct fields', () => {
+    const db = openDb(dbPath);
+    const tasks = new TaskRepository(db);
+    const subtasks = new SubtaskRepository(db);
+    const taskId = tasks.upsert('task-a', 'feat/a');
+    const subtaskId = subtasks.upsert(taskId, 'first', 'echo ok', 'abc123');
+    const row = subtasks.findById(subtaskId);
+    expect(row?.slug).toBe('first');
+    expect(row?.verify).toBe('echo ok');
+    expect(row?.attempts).toBe(0);
+    db.close();
+  });
+
+  test('SubtaskRepository.incrementAttempts increments the counter', () => {
+    const db = openDb(dbPath);
+    const tasks = new TaskRepository(db);
+    const subtasks = new SubtaskRepository(db);
+    const taskId = tasks.upsert('task-a', 'feat/a');
+    const subtaskId = subtasks.upsert(taskId, 'first', 'echo ok', 'abc123');
+    subtasks.incrementAttempts(subtaskId);
+    subtasks.incrementAttempts(subtaskId);
+    const row = subtasks.findById(subtaskId);
+    expect(row?.attempts).toBe(2);
     db.close();
   });
 });
