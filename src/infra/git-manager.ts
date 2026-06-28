@@ -91,6 +91,14 @@ export async function commitAll(repoPath: string, message: string): Promise<void
     throw new Error(`git add failed: ${add.stderr}`);
   }
 
+  // Nothing staged → nothing to commit, so this is a no-op rather than an error.
+  // This is what makes a subtask's checkpoint commit idempotent: if a crash lands
+  // between "commit" and "status recorded" (the subtask is left `running`), the
+  // recovery re-run reaches this point with the change already committed and the
+  // worktree clean — we must not error or fabricate a duplicate commit.
+  const staged = await git(['diff', '--cached', '--quiet'], repoPath);
+  if (staged.exitCode === 0) return;
+
   const commit = await git(['commit', '-m', message], repoPath);
   if (commit.exitCode !== 0) {
     throw new Error(`git commit failed: ${commit.stderr}`);

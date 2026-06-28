@@ -1,5 +1,18 @@
 import type { ExecResult } from '../harness-adapter.ts';
 
+/**
+ * Docker label key stamped on every task container. Carrying the task slug as the
+ * value lets the engine bind a container to its task and lets slice 08's
+ * reconciler enumerate (and kill) orphaned task containers after a crash by
+ * filtering on this key alone.
+ */
+export const TASK_LABEL_KEY = 'pi-task-manager.task';
+
+/** The full `key=value` label for a task's container. */
+export function taskLabel(slug: string): string {
+  return `${TASK_LABEL_KEY}=${slug}`;
+}
+
 async function readText(stream: ReadableStream<Uint8Array> | null): Promise<string> {
   if (!stream) return '';
   return new Response(stream).text();

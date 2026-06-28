@@ -4,6 +4,7 @@ import { loadTaskSpec } from './spec-loader.ts';
 import { openDb } from './infra/db/index.ts';
 import { runTask } from './engine.ts';
 import { runQueue } from './task-scheduler.ts';
+import { reconcile } from './reconciler.ts';
 import { resolveApiKey, AuthError } from './infra/auth.ts';
 import type { TaskSpec } from './types.ts';
 
@@ -15,6 +16,17 @@ async function main(): Promise<void> {
   mkdirSync(stateDir, { recursive: true });
 
   const db = openDb(join(stateDir, 'engine.db'));
+
+  // Crash recovery: before resuming the queue, reconcile SQLite + containers
+  // against reality. Any subtask left `running` by a prior crash is reset to
+  // `pending` (re-run), and orphaned task containers are killed. No daemon means
+  // this is the only recovery point — it happens on each manual invocation.
+  const recovery = await reconcile(db);
+  if (recovery.resetSubtasks > 0) {
+    console.log(
+      `Recovery: reset ${recovery.resetSubtasks} interrupted subtask(s) to pending; re-running.`
+    );
+  }
 
   // Fail fast on a missing credential — clearer here than as a confusing agent
   // error mid-run. Sourced from host env or a gitignored secrets file.

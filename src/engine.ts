@@ -11,6 +11,7 @@ import {
   startContainer,
   execInContainer,
   stopContainer,
+  taskLabel,
 } from './infra/container-manager.ts';
 import { createWorktree, removeWorktree, commitAll, diffChanges } from './infra/git-manager.ts';
 import { buildTaskImage } from './infra/image-resolver.ts';
@@ -171,7 +172,7 @@ export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void
   }
 
   // Label by task slug so slice 08's orphan-kill can find this container later.
-  const containerLabel = `pi-task-manager.task=${task.slug}`;
+  const containerLabel = taskLabel(task.slug);
 
   let containerId: string;
   try {
