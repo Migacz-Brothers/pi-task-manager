@@ -1,5 +1,5 @@
 import { Database } from 'bun:sqlite';
-import type { SubtaskStatus } from '../types.ts';
+import type { SubtaskStatus } from '../../types.ts';
 
 export interface SubtaskRow {
   id: number;

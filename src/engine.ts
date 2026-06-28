@@ -1,14 +1,14 @@
 import type { Database } from 'bun:sqlite';
 import type { TaskSpec } from './types.ts';
-import { TaskRepository, SubtaskRepository } from './db/index.ts';
+import { TaskRepository, SubtaskRepository } from './infrastructure/db/index.ts';
 import { runPiHarness } from './harness-adapter.ts';
 import type { ExecResult } from './harness-adapter.ts';
 import {
   startContainer,
   execInContainer,
   stopContainer,
-} from './container-manager.ts';
-import { ensureBranch, commitAll } from './git-manager.ts';
+} from './infrastructure/container-manager.ts';
+import { ensureBranch, commitAll } from './infrastructure/git-manager.ts';
 
 const DEFAULT_IMAGE = 'ubuntu:22.04';
 

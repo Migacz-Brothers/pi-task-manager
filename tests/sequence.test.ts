@@ -3,7 +3,7 @@ import { join } from 'path';
 import { mkdirSync, writeFileSync, rmSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { loadTaskSpec } from '../src/spec-loader.ts';
-import { openDb, TaskRepository, SubtaskRepository } from '../src/db/index.ts';
+import { openDb, TaskRepository, SubtaskRepository } from '../src/infrastructure/db/index.ts';
 import { runTask } from '../src/engine.ts';
 import type { EngineDeps } from '../src/engine.ts';
 import type { ExecResult } from '../src/harness-adapter.ts';

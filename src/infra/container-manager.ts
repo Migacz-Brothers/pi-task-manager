@@ -1,4 +1,4 @@
-import type { ExecResult } from './harness-adapter.ts';
+import type { ExecResult } from '../harness-adapter.ts';
 
 async function readText(stream: ReadableStream<Uint8Array> | null): Promise<string> {
   if (!stream) return '';
