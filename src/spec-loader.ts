@@ -3,6 +3,7 @@ import { join } from 'path';
 import matter from 'gray-matter';
 import { createHash } from 'crypto';
 import type { TaskSpec, SubtaskSpec } from './types.ts';
+import { findCycle } from './scheduler.ts';
 
 export class SpecLoadError extends Error {
   constructor(message: string) {
@@ -86,6 +87,13 @@ export function loadTaskSpec(taskDir: string): TaskSpec {
         );
       }
     }
+  }
+
+  // No cycles — a cyclic graph (including a self-referential blockedBy) can never
+  // make progress, so the task refuses to start.
+  const cycle = findCycle(subtasks.map(s => ({ slug: s.slug, blockedBy: s.blockedBy })));
+  if (cycle) {
+    throw new SpecLoadError(`Dependency cycle detected: ${cycle.join(' -> ')}`);
   }
 
   return {

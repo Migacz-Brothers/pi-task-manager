@@ -3,7 +3,7 @@ import { join } from 'path';
 import { mkdirSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { loadTaskSpec, SpecLoadError } from '../src/spec-loader.ts';
-import { openDb, TaskRepository, SubtaskRepository } from '../src/infrastructure/db/index.ts';
+import { openDb, TaskRepository, SubtaskRepository } from '../src/infra/db/index.ts';
 import { parseEventStream } from '../src/harness-adapter.ts';
 
 // ── Spec Loader ───────────────────────────────────────────────────────────────
