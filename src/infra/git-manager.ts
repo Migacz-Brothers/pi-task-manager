@@ -85,21 +85,31 @@ export async function removeWorktree(repoPath: string, worktreePath: string): Pr
   }
 }
 
-export async function commitAll(repoPath: string, message: string): Promise<void> {
+export async function commitAll(
+  repoPath: string,
+  message: string,
+  allowEmpty = false
+): Promise<void> {
   const add = await git(['add', '-A'], repoPath);
   if (add.exitCode !== 0) {
     throw new Error(`git add failed: ${add.stderr}`);
   }
 
-  // Nothing staged → nothing to commit, so this is a no-op rather than an error.
-  // This is what makes a subtask's checkpoint commit idempotent: if a crash lands
-  // between "commit" and "status recorded" (the subtask is left `running`), the
-  // recovery re-run reaches this point with the change already committed and the
-  // worktree clean — we must not error or fabricate a duplicate commit.
+  // Nothing staged → nothing to commit, so this is normally a no-op rather than an
+  // error. This is what makes a subtask's checkpoint commit idempotent: if a crash
+  // lands between "commit" and "status recorded" (the subtask is left `running`),
+  // the recovery re-run reaches this point with the change already committed and
+  // the worktree clean — we must not error or fabricate a duplicate commit.
+  //
+  // `allowEmpty` overrides this for a `hitl` approve: the human may have changed
+  // nothing in the worktree (the work was a judgment or an external action), but
+  // the approval still earns a checkpoint commit so the branch history records it.
   const staged = await git(['diff', '--cached', '--quiet'], repoPath);
-  if (staged.exitCode === 0) return;
+  if (staged.exitCode === 0 && !allowEmpty) return;
 
-  const commit = await git(['commit', '-m', message], repoPath);
+  const args = ['commit', '-m', message];
+  if (allowEmpty) args.push('--allow-empty');
+  const commit = await git(args, repoPath);
   if (commit.exitCode !== 0) {
     throw new Error(`git commit failed: ${commit.stderr}`);
   }

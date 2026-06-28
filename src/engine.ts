@@ -1,9 +1,9 @@
 import type { Database } from 'bun:sqlite';
 import { join } from 'path';
 import { mkdirSync } from 'fs';
-import type { TaskSpec, SubtaskStatus, FinalResult, FinalStatus } from './types.ts';
+import type { TaskSpec, SubtaskSpec, SubtaskStatus, FinalResult, FinalStatus } from './types.ts';
 import { schedule } from './scheduler.ts';
-import { TaskRepository, SubtaskRepository } from './infra/db/index.ts';
+import { TaskRepository, SubtaskRepository, CommandRepository, EventRepository } from './infra/db/index.ts';
 import { runPiHarness } from './harness-adapter.ts';
 import type { ExecResult } from './harness-adapter.ts';
 import { assembleRetryPrompt } from './context-assembler.ts';
@@ -14,6 +14,7 @@ import {
   taskLabel,
 } from './infra/container-manager.ts';
 import { createWorktree, removeWorktree, commitAll, diffChanges } from './infra/git-manager.ts';
+import { execHost } from './infra/host-exec.ts';
 import { buildTaskImage } from './infra/image-resolver.ts';
 
 /**
@@ -56,8 +57,15 @@ export interface EngineDeps {
     signal?: AbortSignal
   ): Promise<ExecResult>;
   stopContainer(containerId: string): Promise<void>;
-  commitAll(repoPath: string, message: string): Promise<void>;
+  commitAll(repoPath: string, message: string, allowEmpty?: boolean): Promise<void>;
   diffChanges(repoPath: string): Promise<string>;
+  /**
+   * Run a command on the host worktree (not in a container). Used only for a
+   * `hitl` subtask's approve-time verify, which runs no container. Optional so the
+   * many container-only test rigs need not stub it; falls back to the real
+   * host-exec when absent.
+   */
+  execHost?(cwd: string, cmd: string[]): Promise<ExecResult>;
 }
 
 const defaultDeps: EngineDeps = {
@@ -69,6 +77,7 @@ const defaultDeps: EngineDeps = {
   stopContainer,
   commitAll,
   diffChanges,
+  execHost,
 };
 
 export interface EngineOptions {
@@ -140,6 +149,9 @@ export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void
   const worktreesDir = opts.worktreesDir ?? join(repoPath, '.specs', '.state', 'worktrees');
   const taskRepo = new TaskRepository(db);
   const subtaskRepo = new SubtaskRepository(db);
+  const commandRepo = new CommandRepository(db);
+  const eventRepo = new EventRepository(db);
+  const runHostVerify = deps.execHost ?? execHost;
 
   const taskId = taskRepo.upsert(task.slug, task.branch);
 
@@ -153,41 +165,44 @@ export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void
   // Each task runs on its own worktree + branch (named from frontmatter). All git
   // operations — commit-per-subtask, diffs for retry context — target the
   // worktree, never the main checkout, so parallel tasks never clobber each other.
+  // The worktree is created up front because both the container path *and* the
+  // host-side `hitl` approve path operate against it.
   const worktreePath = join(worktreesDir, task.slug);
   mkdirSync(worktreesDir, { recursive: true });
   await deps.createWorktree(repoPath, task.branch, worktreePath);
 
-  // Image = the repo's dev container (or the frontmatter `image:` override) with
-  // the harness layered on. Resolved against the worktree so it reflects the
-  // task branch's toolchain. A config error here (no dev container, no override)
-  // fails the task before any container starts, leaving the worktree for
-  // inspection.
-  let image: string;
-  try {
-    image = await deps.resolveImage(worktreePath, task.image, task.slug);
-  } catch (err) {
-    throw new Error(
-      `Image resolution failed for task '${task.slug}': ${err instanceof Error ? err.message : err}`
-    );
-  }
-
-  // Label by task slug so slice 08's orphan-kill can find this container later.
+  // Lazy container: a task made entirely of `hitl` subtasks must start no
+  // container and no harness at all, so the image is resolved and the container
+  // started only when the first agent-backed subtask actually needs to run.
+  // Memoized — every agent-backed subtask in the task reuses the one container.
   const containerLabel = taskLabel(task.slug);
-
-  let containerId: string;
-  try {
-    // Bind the container to the worktree (not the repo root): the agent edits
-    // files in the isolated checkout, and its commits land on the task branch.
-    // No secrets at start time — the API key is injected at `docker exec` time
-    // (see harness-adapter), so it never lives in the container's run config.
-    containerId = await deps.startContainer(image, worktreePath, containerLabel, {});
-  } catch (err) {
-    throw new Error(`Container failed to start for task '${task.slug}': ${err}`);
+  let containerId: string | undefined;
+  async function ensureContainer(): Promise<string> {
+    if (containerId) return containerId;
+    // Image = the repo's dev container (or the frontmatter `image:` override) with
+    // the harness layered on. Resolved against the worktree so it reflects the
+    // task branch's toolchain.
+    let image: string;
+    try {
+      image = await deps.resolveImage(worktreePath, task.image, task.slug);
+    } catch (err) {
+      throw new Error(
+        `Image resolution failed for task '${task.slug}': ${err instanceof Error ? err.message : err}`
+      );
+    }
+    try {
+      // Bind the container to the worktree (not the repo root); no secrets at start
+      // time — the API key is injected at `docker exec` time (see harness-adapter).
+      containerId = await deps.startContainer(image, worktreePath, containerLabel, {});
+    } catch (err) {
+      throw new Error(`Container failed to start for task '${task.slug}': ${err}`);
+    }
+    return containerId;
   }
 
   // Graph nodes for the scheduler: stable slug + declared dependencies. The
   // scheduler is a pure function of (this graph, runtime state); the engine owns
-  // all the I/O and the "halt on failure" policy around it.
+  // all the I/O and the "halt on pause" policy around it.
   const nodes = task.subtasks.map(s => ({ slug: s.slug, blockedBy: s.blockedBy }));
   const bodyBySlug = new Map(task.subtasks.map(s => [s.slug, s]));
 
@@ -199,16 +214,208 @@ export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void
     return m;
   };
 
+  // Notes a human attached to a `retry` command, injected into the re-run's first
+  // attempt and consumed there.
+  const retryNotes = new Map<string, string>();
+  let aborted = false;
+
+  /**
+   * Run a hitl subtask's approve: run its declared verify on the host worktree (if
+   * any), and — only if green — commit the human's changes (empty allowed) and
+   * pass it. A red verify leaves the subtask `needs_human` for the human to fix.
+   */
+  async function approveHitl(sub: SubtaskSpec, id: number): Promise<void> {
+    const verify = sub.verify.trim();
+    const hasVerify = verify !== '' && verify.toLowerCase() !== 'none';
+    if (hasVerify) {
+      const res = await runHostVerify(worktreePath, ['sh', '-c', sub.verify]);
+      if (res.exitCode !== 0) {
+        const out = [res.stdout, res.stderr].filter(Boolean).join('\n');
+        eventRepo.record(task.slug, sub.slug, 'approve_verify_failed', out);
+        console.log(`  [${sub.slug}] approve verify failed — remains needs_human`);
+        if (out) console.log(out);
+        return;
+      }
+    }
+    // Empty commit allowed: the human's work may have been a judgment or an
+    // external action that left the worktree unchanged, but the approval still
+    // earns a checkpoint on the branch.
+    await deps.commitAll(worktreePath, `${task.slug}(${sub.slug}): approved`, true);
+    subtaskRepo.setStatus(id, 'passed');
+    console.log(`  [${sub.slug}] approved (hitl) — committed and continuing`);
+  }
+
+  /**
+   * Apply one human command to a paused subtask. Action sets are gated by the
+   * pause reason: a `hitl` pause accepts approve/skip/abort; a failure pause
+   * accepts retry/skip/abort. An out-of-set action (e.g. `retry` on a hitl
+   * subtask — there is no agent run to retry) is rejected, recorded, and the
+   * subtask stays paused.
+   */
+  async function applyCommand(
+    sub: SubtaskSpec,
+    id: number,
+    action: string,
+    payload: string | null
+  ): Promise<void> {
+    const reason = sub.hitl ? 'hitl' : 'failure';
+    const valid = sub.hitl
+      ? action === 'approve' || action === 'skip' || action === 'abort'
+      : action === 'retry' || action === 'skip' || action === 'abort';
+    if (!valid) {
+      eventRepo.record(task.slug, sub.slug, `command_rejected:${action}`, `invalid for a ${reason} pause`);
+      console.log(`  [${sub.slug}] command '${action}' rejected (invalid for a ${reason} pause)`);
+      return;
+    }
+
+    eventRepo.record(task.slug, sub.slug, `command:${action}`, payload ?? undefined);
+    switch (action) {
+      case 'retry':
+        if (payload) retryNotes.set(sub.slug, payload);
+        subtaskRepo.setStatus(id, 'pending');
+        console.log(`  [${sub.slug}] retry${payload ? ' (with note)' : ''}`);
+        break;
+      case 'approve':
+        await approveHitl(sub, id);
+        break;
+      case 'skip':
+        // A skipped subtask does not satisfy `blockedBy`; the scheduler cascades
+        // `blocked` to its dependents on the next pass.
+        subtaskRepo.setStatus(id, 'skipped');
+        console.log(`  [${sub.slug}] skipped`);
+        break;
+      case 'abort':
+        aborted = true;
+        taskRepo.setStatus(taskId, 'aborted');
+        console.log(`  [${sub.slug}] abort — stopping task, keeping worktree + branch`);
+        break;
+    }
+  }
+
+  /**
+   * Drain the command bus for every currently-paused subtask, applying the oldest
+   * queued command for each (exactly once). Returns how many commands were
+   * applied; the caller re-evaluates the schedule whenever this is > 0.
+   */
+  async function resolveCommands(): Promise<number> {
+    let applied = 0;
+    for (const sub of task.subtasks) {
+      const id = subtaskRepo.findId(taskId, sub.slug);
+      if (subtaskRepo.getStatus(id) !== 'needs_human') continue;
+      const cmd = commandRepo.nextPending(task.slug, sub.slug);
+      if (!cmd) continue;
+      if (!commandRepo.consume(cmd.id)) continue; // lost a race — already consumed
+      applied++;
+      await applyCommand(sub, id, cmd.action, cmd.payload);
+      if (aborted) break;
+    }
+    return applied;
+  }
+
+  /**
+   * The per-subtask attempt → verify → commit/retry loop. Runs a fresh harness
+   * each attempt over the partial changes still on disk (fix-forward); after K
+   * attempts it returns false (escalate). A human `retry` note, if present, is
+   * folded into this re-run's prompt.
+   */
+  async function runSubtask(cid: string, subtask: SubtaskSpec, subtaskId: number): Promise<boolean> {
+    const note = retryNotes.get(subtask.slug);
+    retryNotes.delete(subtask.slug);
+
+    // Attempt 1 normally runs the raw body; a human `retry` note turns it into a
+    // fix-forward prompt over the changes already on disk.
+    let prompt = subtask.body;
+    if (note) {
+      const diff = await deps.diffChanges(worktreePath);
+      prompt = assembleRetryPrompt({
+        body: subtask.body,
+        attempt: 1,
+        maxAttempts: MAX_ATTEMPTS,
+        verifyOutput: '',
+        diff,
+        note,
+      });
+    }
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      subtaskRepo.setStatus(subtaskId, 'running');
+      subtaskRepo.incrementAttempts(subtaskId);
+
+      const harnessResult = await runAttempt(cid, prompt, apiKey, attemptTimeoutMs, deps);
+
+      // Classify the attempt. A harness crash/timeout short-circuits; otherwise
+      // the verify is authoritative — a self-reported success never overrides a
+      // red verify.
+      let outcome: FinalStatus;
+      let verifyOutput = '';
+      if (harnessResult.status === 'harness_error') {
+        outcome = 'harness_error';
+        verifyOutput = harnessResult.summary;
+      } else {
+        const verifyResult = await deps.execInContainer(cid, ['sh', '-c', subtask.verify]);
+        if (verifyResult.exitCode === 0) {
+          outcome = 'passed';
+        } else {
+          outcome = 'verify_failed';
+          verifyOutput = [verifyResult.stdout, verifyResult.stderr].filter(Boolean).join('\n');
+        }
+      }
+
+      if (outcome === 'passed') {
+        // One commit per passing subtask. The message encodes task + subtask slug
+        // so the branch history is self-describing.
+        await deps.commitAll(worktreePath, `${task.slug}(${subtask.slug}): passed`);
+        subtaskRepo.setStatus(subtaskId, 'passed');
+        console.log(`  [${subtask.slug}] passed (attempt ${attempt}/${MAX_ATTEMPTS})`);
+        return true;
+      }
+
+      subtaskRepo.setStatus(subtaskId, outcome);
+      console.log(`  [${subtask.slug}] ${outcome} (attempt ${attempt}/${MAX_ATTEMPTS})`);
+      if (verifyOutput) console.log(verifyOutput);
+
+      // Fold any handoff fragment into the next attempt, then clear it so it can't
+      // leak forward stale.
+      const fragment = await readFragment(cid, deps);
+      await clearFragment(cid, deps);
+
+      if (attempt < MAX_ATTEMPTS) {
+        const diff = await deps.diffChanges(worktreePath);
+        prompt = assembleRetryPrompt({
+          body: subtask.body,
+          attempt: attempt + 1,
+          maxAttempts: MAX_ATTEMPTS,
+          verifyOutput,
+          diff,
+          fragment,
+          note,
+        });
+      }
+    }
+    return false;
+  }
+
+  // A task with any agent-backed (non-`hitl`) subtask needs a container for this
+  // run, so start it up front — this also surfaces an image-config error before
+  // the loop and keeps the lifecycle uniform across resumes (even one that ends up
+  // running nothing). A *pure*-`hitl` task takes neither branch: it starts no
+  // container and no harness, exactly as a hitl pause requires.
+  const hasAgentWork = task.subtasks.some(s => !s.hitl);
+  if (hasAgentWork) await ensureContainer();
+
   // Cleanup disposition: only a clean, fully-completed run removes the worktree
-  // (keeping the branch). A halt → needs_human, an abort, or a thrown error all
-  // leave the worktree in place for inspection.
+  // (keeping the branch). A pause → needs_human, a skip, an abort, or a thrown
+  // error all leave the worktree in place for inspection.
   let succeeded = false;
   try {
-    // A failure halts the task: we stop pulling new runnable work but still apply
-    // the cascade so dependents end `blocked` rather than silently `pending`.
-    let halted = false;
-
     while (true) {
+      // Phase 1 — resolve any paused subtask via the command bus. Applying a
+      // command (retry/approve/skip/abort) advances state, so re-evaluate.
+      const applied = await resolveCommands();
+      if (aborted) break;
+      if (applied > 0) continue;
+
+      // Phase 2 — schedule against the current state.
       const state = snapshot();
       const { runnable, blocked } = schedule(nodes, state);
 
@@ -219,91 +426,53 @@ export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void
         console.log(`  [${slug}] blocked (a dependency did not pass)`);
       }
 
-      // `runnable` excludes already-`passed` subtasks, so resumed runs skip them
-      // and produce no duplicate commits.
-      if (halted || runnable.length === 0) break;
+      // An unresolved pause halts the task: stop pulling new runnable work so an
+      // independent subtask never races ahead of a pending human decision. The
+      // cascade above has already run, so dependents end `blocked`, not `pending`.
+      const paused = [...state.values()].some(s => s === 'needs_human');
+      if (paused || runnable.length === 0) break;
 
       const subtask = bodyBySlug.get(runnable[0])!;
       const subtaskId = subtaskRepo.findId(taskId, subtask.slug);
 
-      // Attempt loop: the first attempt runs the subtask body; each retry runs a
-      // fresh harness over the partial changes still on disk (fix-forward), fed a
-      // prompt assembled from the failure. After K attempts the subtask escalates.
-      let prompt = subtask.body;
-      let passed = false;
-
-      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-        subtaskRepo.setStatus(subtaskId, 'running');
-        subtaskRepo.incrementAttempts(subtaskId);
-
-        const harnessResult = await runAttempt(containerId, prompt, apiKey, attemptTimeoutMs, deps);
-
-        // Classify the attempt. A harness crash/timeout short-circuits; otherwise
-        // the verify is authoritative — a self-reported success never overrides a
-        // red verify.
-        let outcome: FinalStatus;
-        let verifyOutput = '';
-        if (harnessResult.status === 'harness_error') {
-          outcome = 'harness_error';
-          verifyOutput = harnessResult.summary;
-        } else {
-          const verifyResult = await deps.execInContainer(containerId, ['sh', '-c', subtask.verify]);
-          if (verifyResult.exitCode === 0) {
-            outcome = 'passed';
-          } else {
-            outcome = 'verify_failed';
-            verifyOutput = [verifyResult.stdout, verifyResult.stderr].filter(Boolean).join('\n');
-          }
-        }
-
-        if (outcome === 'passed') {
-          // One commit per passing subtask. The message encodes task + subtask
-          // slug so the branch history is self-describing and the engine can
-          // later recognize its own checkpoints.
-          await deps.commitAll(worktreePath, `${task.slug}(${subtask.slug}): passed`);
-          subtaskRepo.setStatus(subtaskId, 'passed');
-          console.log(`  [${subtask.slug}] passed (attempt ${attempt}/${MAX_ATTEMPTS})`);
-          passed = true;
-          break;
-        }
-
-        subtaskRepo.setStatus(subtaskId, outcome);
-        console.log(`  [${subtask.slug}] ${outcome} (attempt ${attempt}/${MAX_ATTEMPTS})`);
-        if (verifyOutput) console.log(verifyOutput);
-
-        // Fold any handoff fragment into the next attempt, then clear it so it
-        // can't leak forward stale.
-        const fragment = await readFragment(containerId, deps);
-        await clearFragment(containerId, deps);
-
-        if (attempt < MAX_ATTEMPTS) {
-          const diff = await deps.diffChanges(worktreePath);
-          prompt = assembleRetryPrompt({
-            body: subtask.body,
-            attempt: attempt + 1,
-            maxAttempts: MAX_ATTEMPTS,
-            verifyOutput,
-            diff,
-            fragment,
-          });
-        }
+      // A `hitl` subtask runs no harness and no container: pause immediately,
+      // surfacing the authored body as the human's instructions, then loop back so
+      // a queued command (approve/skip/abort) can resolve it.
+      if (subtask.hitl) {
+        subtaskRepo.setStatus(subtaskId, 'needs_human');
+        eventRepo.record(task.slug, subtask.slug, 'needs_human:hitl', subtask.body);
+        console.log(`  [${subtask.slug}] needs_human (hitl) — awaiting approve/skip/abort`);
+        if (subtask.body) console.log(subtask.body);
+        continue;
       }
 
+      // Agent-backed subtask: start the container on first need, then run the loop.
+      const cid = await ensureContainer();
+      const passed = await runSubtask(cid, subtask, subtaskId);
       if (!passed) {
-        // K attempts exhausted: escalate and halt the task. Re-loop once so the
-        // cascade marks this subtask's dependents `blocked`.
         subtaskRepo.setStatus(subtaskId, 'needs_human');
+        eventRepo.record(
+          task.slug,
+          subtask.slug,
+          'needs_human:failure',
+          `escalated after ${MAX_ATTEMPTS} attempts`
+        );
         console.log(`  [${subtask.slug}] needs_human after ${MAX_ATTEMPTS} attempts`);
-        halted = true;
         continue;
       }
     }
 
-    // Reached only when the loop drains all runnable work without halting: every
-    // subtask passed. This is the sole path that earns worktree teardown.
-    succeeded = !halted;
+    // Success = the run wasn't aborted and every subtask passed. A `skipped`,
+    // `blocked`, or `needs_human` subtask all mean unfinished work → keep the
+    // worktree for inspection.
+    succeeded =
+      !aborted &&
+      task.subtasks.every(
+        s => subtaskRepo.getStatus(subtaskRepo.findId(taskId, s.slug)) === 'passed'
+      );
   } finally {
-    await deps.stopContainer(containerId);
+    // Only stop a container that was actually started (a pure-hitl task starts none).
+    if (containerId) await deps.stopContainer(containerId);
 
     // Success → remove the worktree, keep the branch (commits survive in the
     // shared object store). Any non-success exit keeps both for inspection.

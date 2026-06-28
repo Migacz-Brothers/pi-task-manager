@@ -21,6 +21,12 @@ export interface RetryContext {
   diff: string;
   /** Optional handoff notes the agent wrote to `.orchestrator/handoff.md`. */
   fragment?: string;
+  /**
+   * Optional note a human attached to a `retry` command. Carries human guidance
+   * the automated context (verify output, diff, fragment) can't — surfaced
+   * prominently so the next attempt acts on it.
+   */
+  note?: string;
 }
 
 /** Wrap text in a fenced block, picking a fence long enough to not collide with the content. */
@@ -54,6 +60,11 @@ export function assembleRetryPrompt(ctx: RetryContext): string {
   const fragment = ctx.fragment?.trim();
   if (fragment) {
     sections.push(`### Handoff notes from the previous attempt\n${fragment}`);
+  }
+
+  const note = ctx.note?.trim();
+  if (note) {
+    sections.push(`### Note from the human (act on this)\n${note}`);
   }
 
   return sections.join('\n\n') + '\n';

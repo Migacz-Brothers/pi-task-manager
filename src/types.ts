@@ -7,7 +7,15 @@ export type SubtaskStatus =
   | 'verify_failed'
   | 'harness_error'
   | 'blocked'
-  | 'needs_human';
+  | 'needs_human'
+  | 'skipped';
+
+/**
+ * Human intents carried on the `commands` bus (TUI/CLI → engine). Action sets are
+ * gated by the pause reason: a failure `needs_human` accepts `retry`/`skip`/`abort`;
+ * an author-marked `hitl` `needs_human` accepts `approve`/`skip`/`abort`.
+ */
+export type CommandAction = 'retry' | 'approve' | 'skip' | 'abort';
 
 export type HarnessEvent =
   | { type: 'task_started' }

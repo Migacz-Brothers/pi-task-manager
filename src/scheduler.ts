@@ -29,7 +29,10 @@ export function isBlockingStatus(status: SubtaskStatus | undefined): boolean {
     status === 'verify_failed' ||
     status === 'harness_error' ||
     status === 'blocked' ||
-    status === 'needs_human'
+    status === 'needs_human' ||
+    // A skipped subtask never satisfies `blockedBy`, so it blocks its dependents
+    // exactly like a failed one — the human moved past it, not through it.
+    status === 'skipped'
   );
 }
 

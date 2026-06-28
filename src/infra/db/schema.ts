@@ -39,5 +39,14 @@ function migrate(db: Database): void {
       created_at   INTEGER NOT NULL DEFAULT (unixepoch()),
       consumed     INTEGER NOT NULL DEFAULT 0
     );
+
+    CREATE TABLE IF NOT EXISTS events (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_slug    TEXT    NOT NULL,
+      subtask_slug TEXT,
+      type         TEXT    NOT NULL,
+      detail       TEXT,
+      created_at   INTEGER NOT NULL DEFAULT (unixepoch())
+    );
   `);
 }

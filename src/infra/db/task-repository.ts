@@ -22,6 +22,10 @@ export class TaskRepository {
     return row.id;
   }
 
+  setStatus(id: number, status: string): void {
+    this.db.run('UPDATE tasks SET status = ? WHERE id = ?', [status, id]);
+  }
+
   findById(id: number): TaskRow | null {
     return this.db
       .query('SELECT id, slug, branch, status FROM tasks WHERE id = ?')
