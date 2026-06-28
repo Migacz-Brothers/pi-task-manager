@@ -3,7 +3,9 @@ import { readdirSync, statSync, mkdirSync } from 'fs';
 import { loadTaskSpec } from './spec-loader.ts';
 import { openDb } from './infra/db/index.ts';
 import { runTask } from './engine.ts';
+import { runQueue } from './task-scheduler.ts';
 import { resolveApiKey, AuthError } from './infra/auth.ts';
+import type { TaskSpec } from './types.ts';
 
 async function main(): Promise<void> {
   const repoPath = process.cwd();
@@ -51,22 +53,23 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Load every task spec up front; a spec that fails to parse is reported and
+  // dropped so it can't stall the queue. `taskDirs` is already in directory order,
+  // which the pool preserves as its deterministic queue ordering.
+  const tasks: TaskSpec[] = [];
   for (const taskDir of taskDirs) {
-    let task;
     try {
-      task = loadTaskSpec(taskDir);
+      tasks.push(loadTaskSpec(taskDir));
     } catch (err) {
       console.error(`Failed to load task at ${taskDir}: ${err}`);
-      continue;
-    }
-
-    console.log(`Task: ${task.slug}  branch: ${task.branch}`);
-    try {
-      await runTask(task, { repoPath, apiKey, db });
-    } catch (err) {
-      console.error(`Task '${task.slug}' failed: ${err}`);
     }
   }
+
+  // One-shot run: up to N tasks execute concurrently, each fully isolated; the
+  // pool drains the queue and resolves, then the process exits.
+  await runQueue(tasks, {
+    runTask: task => runTask(task, { repoPath, apiKey, db }),
+  });
 
   console.log('Done.');
 }
