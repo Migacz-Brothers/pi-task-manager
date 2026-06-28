@@ -18,6 +18,34 @@ async function readText(stream: ReadableStream<Uint8Array> | null): Promise<stri
   return new Response(stream).text();
 }
 
+/**
+ * Read a stream to a string while forwarding each decoded chunk to `onChunk` as
+ * it arrives. Lets the engine react to the harness event stream live; with no
+ * callback this is equivalent to {@link readText} but goes chunk-by-chunk.
+ */
+async function readTextStreaming(
+  stream: ReadableStream<Uint8Array> | null,
+  onChunk: (chunk: string) => void
+): Promise<string> {
+  if (!stream) return '';
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let acc = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = decoder.decode(value, { stream: true });
+    acc += chunk;
+    onChunk(chunk);
+  }
+  const tail = decoder.decode();
+  if (tail) {
+    acc += tail;
+    onChunk(tail);
+  }
+  return acc;
+}
+
 export async function startContainer(
   image: string,
   repoPath: string,
@@ -59,7 +87,8 @@ export async function execInContainer(
   cmd: string[],
   envVars: Record<string, string> = {},
   stdin?: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onStdout?: (chunk: string) => void
 ): Promise<ExecResult> {
   const envArgs = Object.entries(envVars).flatMap(([k, v]) => ['-e', `${k}=${v}`]);
 
@@ -79,7 +108,7 @@ export async function execInContainer(
 
   try {
     const [stdout, stderr] = await Promise.all([
-      readText(proc.stdout),
+      onStdout ? readTextStreaming(proc.stdout, onStdout) : readText(proc.stdout),
       readText(proc.stderr),
       proc.exited,
     ]);

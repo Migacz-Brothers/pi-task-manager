@@ -1,7 +1,7 @@
 import type { Database } from 'bun:sqlite';
 import { join } from 'path';
 import { mkdirSync } from 'fs';
-import type { TaskSpec, SubtaskSpec, SubtaskStatus, FinalResult, FinalStatus } from './types.ts';
+import type { TaskSpec, SubtaskSpec, SubtaskStatus, FinalResult, FinalStatus, HarnessEvent } from './types.ts';
 import { schedule } from './scheduler.ts';
 import { TaskRepository, SubtaskRepository, CommandRepository, EventRepository } from './infra/db/index.ts';
 import { runPiHarness } from './harness-adapter.ts';
@@ -26,6 +26,48 @@ import { buildTaskImage } from './infra/image-resolver.ts';
  */
 const MAX_ATTEMPTS = 2;
 const ATTEMPT_TIMEOUT_MS = 20 * 60 * 1000;
+
+/**
+ * Minimum spacing between `current_activity` writes while consuming the harness
+ * stream. The stream can emit far faster than a human (or the ~250ms TUI poll)
+ * can read, so activity is throttled to one write per this interval — the live
+ * line stays current without hammering SQLite on every token.
+ */
+const ACTIVITY_THROTTLE_MS = 250;
+
+/** Collapse a harness event into a single, length-capped activity line. */
+function activityLine(ev: HarnessEvent): string | null {
+  switch (ev.type) {
+    case 'task_started':
+      return 'agent started';
+    case 'tool_use': {
+      const detail = summarizeToolInput(ev.input);
+      return detail ? `${ev.tool}: ${detail}` : ev.tool;
+    }
+    case 'activity':
+      return ev.text;
+    case 'final_result':
+      return null; // terminal — the engine clears activity itself
+  }
+}
+
+/** A short, single-line peek at a tool's input for the activity line. */
+function summarizeToolInput(input: unknown): string {
+  if (input == null) return '';
+  if (typeof input === 'string') return oneLine(input);
+  if (typeof input === 'object') {
+    const obj = input as Record<string, unknown>;
+    const key = obj.path ?? obj.file ?? obj.command ?? obj.cmd ?? obj.query;
+    if (typeof key === 'string') return oneLine(key);
+  }
+  return '';
+}
+
+/** Flatten to one line and cap length so the activity is always a single row. */
+function oneLine(s: string, max = 160): string {
+  const flat = s.replace(/\s+/g, ' ').trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
 
 /** Where the harness is expected to leave handoff notes between attempts. */
 const FRAGMENT_PATH = '.orchestrator/handoff.md';
@@ -54,7 +96,8 @@ export interface EngineDeps {
     cmd: string[],
     env?: Record<string, string>,
     stdin?: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    onStdout?: (chunk: string) => void
   ): Promise<ExecResult>;
   stopContainer(containerId: string): Promise<void>;
   commitAll(repoPath: string, message: string, allowEmpty?: boolean): Promise<void>;
@@ -104,7 +147,8 @@ async function runAttempt(
   prompt: string,
   apiKey: string,
   timeoutMs: number,
-  deps: EngineDeps
+  deps: EngineDeps,
+  onEvent?: (ev: HarnessEvent) => void
 ): Promise<FinalResult> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -121,8 +165,10 @@ async function runAttempt(
       containerId,
       prompt,
       apiKey,
-      (cid, cmd, env, stdin, signal) => deps.execInContainer(cid, cmd, env, stdin, signal),
-      controller.signal
+      (cid, cmd, env, stdin, signal, onStdout) =>
+        deps.execInContainer(cid, cmd, env, stdin, signal, onStdout),
+      controller.signal,
+      onEvent
     );
     return await Promise.race([run, timeout]);
   } finally {
@@ -341,7 +387,21 @@ export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void
       subtaskRepo.setStatus(subtaskId, 'running');
       subtaskRepo.incrementAttempts(subtaskId);
 
-      const harnessResult = await runAttempt(cid, prompt, apiKey, attemptTimeoutMs, deps);
+      // Throttled live activity: stamp the agent phase from the harness stream so
+      // the TUI's running indicator isn't an opaque black box. Throttling keeps
+      // SQLite writes bounded no matter how fast the stream emits.
+      subtaskRepo.setActivity(subtaskId, 'starting agent…', 'agent');
+      let lastActivityAt = 0;
+      const onEvent = (ev: HarnessEvent): void => {
+        const line = activityLine(ev);
+        if (line == null) return;
+        const now = Date.now();
+        if (now - lastActivityAt < ACTIVITY_THROTTLE_MS) return;
+        lastActivityAt = now;
+        subtaskRepo.setActivity(subtaskId, oneLine(line), 'agent');
+      };
+
+      const harnessResult = await runAttempt(cid, prompt, apiKey, attemptTimeoutMs, deps, onEvent);
 
       // Classify the attempt. A harness crash/timeout short-circuits; otherwise
       // the verify is authoritative — a self-reported success never overrides a
@@ -352,6 +412,7 @@ export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void
         outcome = 'harness_error';
         verifyOutput = harnessResult.summary;
       } else {
+        subtaskRepo.setActivity(subtaskId, oneLine(`verifying: ${subtask.verify}`), 'verify');
         const verifyResult = await deps.execInContainer(cid, ['sh', '-c', subtask.verify]);
         if (verifyResult.exitCode === 0) {
           outcome = 'passed';
@@ -360,6 +421,10 @@ export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void
           verifyOutput = [verifyResult.stdout, verifyResult.stderr].filter(Boolean).join('\n');
         }
       }
+
+      // The subtask is no longer actively running; drop the live activity so the
+      // TUI doesn't show a stale line against a settled status.
+      subtaskRepo.clearActivity(subtaskId);
 
       if (outcome === 'passed') {
         // One commit per passing subtask. The message encodes task + subtask slug
@@ -374,10 +439,21 @@ export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void
       console.log(`  [${subtask.slug}] ${outcome} (attempt ${attempt}/${MAX_ATTEMPTS})`);
       if (verifyOutput) console.log(verifyOutput);
 
+      // Persist the failure detail so the TUI's detail pane can show the verify
+      // output / harness error for the selected subtask (otherwise it lives only
+      // on the engine's stdout).
+      eventRepo.record(
+        task.slug,
+        subtask.slug,
+        `attempt_failed:${outcome}`,
+        verifyOutput || undefined
+      );
+
       // Fold any handoff fragment into the next attempt, then clear it so it can't
       // leak forward stale.
       const fragment = await readFragment(cid, deps);
       await clearFragment(cid, deps);
+      if (fragment) eventRepo.record(task.slug, subtask.slug, 'fragment', fragment);
 
       if (attempt < MAX_ATTEMPTS) {
         const diff = await deps.diffChanges(worktreePath);

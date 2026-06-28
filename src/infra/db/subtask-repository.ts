@@ -9,7 +9,12 @@ export interface SubtaskRow {
   status: SubtaskStatus;
   attempts: number;
   content_hash: string;
+  current_activity: string | null;
+  current_phase: string | null;
 }
+
+const ROW_COLUMNS =
+  'id, task_id, slug, verify, status, attempts, content_hash, current_activity, current_phase';
 
 export class SubtaskRepository {
   constructor(private readonly db: Database) {}
@@ -68,8 +73,18 @@ export class SubtaskRepository {
 
   findById(id: number): SubtaskRow | null {
     return this.db
-      .query('SELECT id, task_id, slug, verify, status, attempts, content_hash FROM subtasks WHERE id = ?')
+      .query(`SELECT ${ROW_COLUMNS} FROM subtasks WHERE id = ?`)
       .get(id) as SubtaskRow | null;
+  }
+
+  /**
+   * Every subtask of a task, ordered by id (creation order, which mirrors the
+   * `NN-` file order the engine seeds them in). The TUI's read model for the tree.
+   */
+  listByTask(taskId: number): SubtaskRow[] {
+    return this.db
+      .query(`SELECT ${ROW_COLUMNS} FROM subtasks WHERE task_id = ? ORDER BY id ASC`)
+      .all(taskId) as SubtaskRow[];
   }
 
   getStatus(id: number): SubtaskStatus {
@@ -90,6 +105,26 @@ export class SubtaskRepository {
   incrementAttempts(id: number): void {
     this.db.run(
       `UPDATE subtasks SET attempts = attempts + 1, updated_at = unixepoch() WHERE id = ?`,
+      [id]
+    );
+  }
+
+  /**
+   * Stamp the running subtask's throttled one-line activity (+ phase). Engine-only
+   * write; the TUI reads it for the live activity line. Throttling is the caller's
+   * responsibility — this is the raw setter.
+   */
+  setActivity(id: number, activity: string, phase: string): void {
+    this.db.run(
+      `UPDATE subtasks SET current_activity = ?, current_phase = ?, updated_at = unixepoch() WHERE id = ?`,
+      [activity, phase, id]
+    );
+  }
+
+  /** Clear the live activity once a subtask stops running (passed/failed/paused). */
+  clearActivity(id: number): void {
+    this.db.run(
+      `UPDATE subtasks SET current_activity = NULL, current_phase = NULL, updated_at = unixepoch() WHERE id = ?`,
       [id]
     );
   }

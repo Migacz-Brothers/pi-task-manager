@@ -11,7 +11,13 @@ export type ExecFn = (
   cmd: string[],
   env: Record<string, string>,
   stdin: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  /**
+   * Called with each chunk of stdout as it arrives, so the caller can react to
+   * the harness event stream live (e.g. the engine writing throttled activity)
+   * instead of only after the process exits.
+   */
+  onStdout?: (chunk: string) => void
 ) => Promise<ExecResult>;
 
 /**
@@ -91,12 +97,39 @@ export function parseEventStream(ndjson: string): {
   };
 }
 
+/**
+ * Splits a stdout byte stream into whole NDJSON lines and emits a normalized
+ * {@link HarnessEvent} for each. Buffers any trailing partial line across chunks.
+ */
+function makeStreamConsumer(onEvent: (ev: HarnessEvent) => void): (chunk: string) => void {
+  let buffer = '';
+  return (chunk: string) => {
+    buffer += chunk;
+    let nl: number;
+    while ((nl = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (!line) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const ev = normalizePiEvent(parsed);
+      if (ev) onEvent(ev);
+    }
+  };
+}
+
 export async function runPiHarness(
   containerId: string,
   prompt: string,
   apiKey: string,
   execFn: ExecFn,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  /** Live per-event hook fired as the stream arrives (drives the activity line). */
+  onEvent?: (ev: HarnessEvent) => void
 ): Promise<FinalResult> {
   let execResult: ExecResult;
   try {
@@ -106,7 +139,8 @@ export async function runPiHarness(
       // Auth injected at exec time only — never baked into the image or committed.
       { PI_API_KEY: apiKey },
       prompt,
-      signal
+      signal,
+      onEvent ? makeStreamConsumer(onEvent) : undefined
     );
   } catch (err) {
     return { status: 'harness_error', summary: `exec error: ${err}` };

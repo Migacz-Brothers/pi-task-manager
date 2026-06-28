@@ -31,4 +31,11 @@ export class TaskRepository {
       .query('SELECT id, slug, branch, status FROM tasks WHERE id = ?')
       .get(id) as TaskRow | null;
   }
+
+  /** Every task, in creation order. The TUI's read model for the top-level tree. */
+  list(): TaskRow[] {
+    return this.db
+      .query('SELECT id, slug, branch, status FROM tasks ORDER BY id ASC')
+      .all() as TaskRow[];
+  }
 }

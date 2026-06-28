@@ -51,7 +51,10 @@ export async function reconcile(
   deps: ReconcileDeps = defaultDeps
 ): Promise<ReconcileReport> {
   const { changes } = db.run(
-    `UPDATE subtasks SET status = 'pending', updated_at = unixepoch() WHERE status = 'running'`
+    `UPDATE subtasks
+        SET status = 'pending', current_activity = NULL, current_phase = NULL,
+            updated_at = unixepoch()
+      WHERE status = 'running'`
   );
 
   await deps.killOrphanContainers();
