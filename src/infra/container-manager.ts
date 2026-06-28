@@ -45,7 +45,8 @@ export async function execInContainer(
   containerId: string,
   cmd: string[],
   envVars: Record<string, string> = {},
-  stdin?: string
+  stdin?: string,
+  signal?: AbortSignal
 ): Promise<ExecResult> {
   const envArgs = Object.entries(envVars).flatMap(([k, v]) => ['-e', `${k}=${v}`]);
 
@@ -56,17 +57,28 @@ export async function execInContainer(
     stderr: 'pipe',
   });
 
-  const [stdout, stderr] = await Promise.all([
-    readText(proc.stdout),
-    readText(proc.stderr),
-    proc.exited,
-  ]);
+  // Let the caller (e.g. the engine's per-attempt timeout) kill a hung exec.
+  const onAbort = () => proc.kill();
+  if (signal) {
+    if (signal.aborted) proc.kill();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }
 
-  return {
-    exitCode: proc.exitCode ?? 1,
-    stdout,
-    stderr,
-  };
+  try {
+    const [stdout, stderr] = await Promise.all([
+      readText(proc.stdout),
+      readText(proc.stderr),
+      proc.exited,
+    ]);
+
+    return {
+      exitCode: proc.exitCode ?? 1,
+      stdout,
+      stderr,
+    };
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+  }
 }
 
 export async function stopContainer(containerId: string): Promise<void> {

@@ -50,3 +50,15 @@ export async function currentBranch(repoPath: string): Promise<string> {
   const { stdout } = await git(['rev-parse', '--abbrev-ref', 'HEAD'], repoPath);
   return stdout;
 }
+
+/**
+ * Diff of every uncommitted change in the worktree against HEAD, including
+ * untracked files. Staging with `add -A` first is what lets `diff --cached`
+ * surface new files; the staging is harmless under fix-forward since the next
+ * `commitAll` re-adds everything anyway. Returns the raw diff (possibly empty).
+ */
+export async function diffChanges(repoPath: string): Promise<string> {
+  await git(['add', '-A'], repoPath);
+  const { stdout } = await git(['diff', '--cached', 'HEAD'], repoPath);
+  return stdout;
+}

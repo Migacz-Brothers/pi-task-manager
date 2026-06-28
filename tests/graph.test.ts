@@ -228,10 +228,16 @@ function makeRig(harnessByBody: Record<string, FinalResult> = {}): FakeRig {
     commitAll: async (_repo, message) => {
       commits.push(message);
     },
+    diffChanges: async () => '',
     execInContainer: async (_cid, cmd, _env, stdin): Promise<ExecResult> => {
       if (cmd[0] === 'pi') {
-        harnessBodies.push(stdin ?? '');
-        const r = harnessByBody[stdin ?? ''] ?? { status: 'passed', summary: 'ok' };
+        const body = stdin ?? '';
+        harnessBodies.push(body);
+        // Match by substring so a keyed result sticks across retries: a retry
+        // prompt embeds the original body, so `body a` still resolves to its
+        // configured (e.g. harness_error) outcome on attempt 2.
+        const key = Object.keys(harnessByBody).find(k => body.includes(k));
+        const r = key ? harnessByBody[key] : { status: 'passed' as FinalStatus, summary: 'ok' };
         return { exitCode: 0, stdout: ndjson(r.status, r.summary), stderr: '' };
       }
       const proc = Bun.spawn({ cmd, stdout: 'pipe', stderr: 'pipe' });
@@ -322,9 +328,10 @@ describe('graph: engine wiring', () => {
     await runTask(loadTaskSpec(dir), { repoPath: dir, apiKey: 'k', db, deps: rig.deps });
 
     expect(statusOf(db, 'a')).toBe('passed');
-    expect(statusOf(db, 'b')).toBe('verify_failed');
+    expect(statusOf(db, 'b')).toBe('needs_human'); // exhausted K retries on a red verify
     expect(statusOf(db, 'c')).toBe('blocked'); // cascaded — never ran on a broken base
-    expect(rig.harnessBodies).toEqual(['body a', 'body b']); // c never ran
+    expect(rig.harnessBodies[0]).toBe('body a');
+    expect(rig.harnessBodies.some(b => b.includes('body c'))).toBe(false); // c never ran
     expect(rig.commits).toEqual(['t(a): passed']);
     db.close();
   });
@@ -337,7 +344,7 @@ describe('graph: engine wiring', () => {
 
     await runTask(loadTaskSpec(dir), { repoPath: dir, apiKey: 'k', db, deps: rig.deps });
 
-    expect(statusOf(db, 'a')).toBe('harness_error');
+    expect(statusOf(db, 'a')).toBe('needs_human'); // harness_error on every attempt → escalated
     expect(statusOf(db, 'b')).toBe('blocked');
     expect(rig.commits).toEqual([]);
     db.close();
@@ -360,7 +367,7 @@ describe('graph: engine wiring', () => {
 
     expect(statusOf(db, 'a')).toBe('passed');
     expect(statusOf(db, 'b')).toBe('passed');
-    expect(statusOf(db, 'c')).toBe('verify_failed');
+    expect(statusOf(db, 'c')).toBe('needs_human'); // red verify, retries exhausted
     expect(statusOf(db, 'e')).toBe('blocked'); // one failed parent is enough
     db.close();
   });

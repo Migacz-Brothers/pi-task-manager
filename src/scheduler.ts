@@ -25,7 +25,12 @@ export class GraphCycleError extends Error {
  * blocked by a failed ancestor blocks its own dependents in turn.
  */
 export function isBlockingStatus(status: SubtaskStatus | undefined): boolean {
-  return status === 'verify_failed' || status === 'harness_error' || status === 'blocked';
+  return (
+    status === 'verify_failed' ||
+    status === 'harness_error' ||
+    status === 'blocked' ||
+    status === 'needs_human'
+  );
 }
 
 function indexBySlug(nodes: GraphNode[]): Map<string, number> {

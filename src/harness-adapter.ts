@@ -10,7 +10,8 @@ export type ExecFn = (
   containerId: string,
   cmd: string[],
   env: Record<string, string>,
-  stdin: string
+  stdin: string,
+  signal?: AbortSignal
 ) => Promise<ExecResult>;
 
 function toFinalStatus(s: unknown): FinalStatus {
@@ -77,7 +78,8 @@ export async function runPiHarness(
   containerId: string,
   prompt: string,
   apiKey: string,
-  execFn: ExecFn
+  execFn: ExecFn,
+  signal?: AbortSignal
 ): Promise<FinalResult> {
   let execResult: ExecResult;
   try {
@@ -85,7 +87,8 @@ export async function runPiHarness(
       containerId,
       ['pi', '--mode', 'json'],
       { PI_API_KEY: apiKey },
-      prompt
+      prompt,
+      signal
     );
   } catch (err) {
     return { status: 'harness_error', summary: `exec error: ${err}` };

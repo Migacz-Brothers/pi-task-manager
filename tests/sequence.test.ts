@@ -210,10 +210,15 @@ function makeRig(harnessByBody: Record<string, FinalResult> = {}): FakeRig {
     commitAll: async (_repo, message) => {
       commits.push(message);
     },
+    diffChanges: async () => '',
     execInContainer: async (_cid, cmd, _env, stdin): Promise<ExecResult> => {
       if (cmd[0] === 'pi') {
-        harnessBodies.push(stdin ?? '');
-        const r = harnessByBody[stdin ?? ''] ?? { status: 'passed', summary: 'ok' };
+        const body = stdin ?? '';
+        harnessBodies.push(body);
+        // Substring match so a keyed outcome sticks across retries (a retry
+        // prompt embeds the original body).
+        const key = Object.keys(harnessByBody).find(k => body.includes(k));
+        const r = key ? harnessByBody[key] : { status: 'passed' as FinalStatus, summary: 'ok' };
         return { exitCode: 0, stdout: ndjson(r.status, r.summary), stderr: '' };
       }
       // verify: actually run the shell command so its exit code is real
@@ -290,8 +295,8 @@ describe('sequence: engine', () => {
 
     expect(rig.commits).toEqual(['t(a): passed']);
     expect(statusOf(db, 'a')).toBe('passed');
-    expect(statusOf(db, 'b')).toBe('verify_failed');
-    expect(statusOf(db, 'c')).toBe('pending'); // never ran
+    expect(statusOf(db, 'b')).toBe('needs_human'); // retries exhausted on a red verify
+    expect(statusOf(db, 'c')).toBe('pending'); // never ran (independent, but task halted)
     expect(rig.harnessBodies).not.toContain('body c');
     expect(rig.counts.stopped).toBe(1); // container torn down even on halt
     db.close();
@@ -307,7 +312,7 @@ describe('sequence: engine', () => {
     await runTask(loadTaskSpec(dir), { repoPath: dir, apiKey: 'k', db, deps: rig.deps });
 
     expect(rig.commits).toEqual(['t(a): passed']);
-    expect(statusOf(db, 'b')).toBe('harness_error');
+    expect(statusOf(db, 'b')).toBe('needs_human'); // harness_error on every attempt → escalated
     expect(statusOf(db, 'c')).toBe('pending');
     db.close();
   });

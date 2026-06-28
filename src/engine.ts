@@ -1,17 +1,31 @@
 import type { Database } from 'bun:sqlite';
-import type { TaskSpec, SubtaskStatus } from './types.ts';
+import type { TaskSpec, SubtaskStatus, FinalResult, FinalStatus } from './types.ts';
 import { schedule } from './scheduler.ts';
 import { TaskRepository, SubtaskRepository } from './infra/db/index.ts';
 import { runPiHarness } from './harness-adapter.ts';
 import type { ExecResult } from './harness-adapter.ts';
+import { assembleRetryPrompt } from './context-assembler.ts';
 import {
   startContainer,
   execInContainer,
   stopContainer,
 } from './infra/container-manager.ts';
-import { ensureBranch, commitAll } from './infra/git-manager.ts';
+import { ensureBranch, commitAll, diffChanges } from './infra/git-manager.ts';
 
 const DEFAULT_IMAGE = 'ubuntu:22.04';
+
+/**
+ * Retry policy constants — script-level, deliberately not frontmatter fields so
+ * a subtask spec can't weaken the failure bound. `MAX_ATTEMPTS` (K) caps how many
+ * times a subtask is attempted before it escalates to `needs_human`;
+ * `ATTEMPT_TIMEOUT_MS` is the per-attempt wall-clock budget after which a hung
+ * harness run is killed and classified as a `harness_error`.
+ */
+const MAX_ATTEMPTS = 2;
+const ATTEMPT_TIMEOUT_MS = 20 * 60 * 1000;
+
+/** Where the harness is expected to leave handoff notes between attempts. */
+const FRAGMENT_PATH = '.orchestrator/handoff.md';
 
 /**
  * The side-effecting seams the engine drives (container, exec, git). Injectable
@@ -30,10 +44,12 @@ export interface EngineDeps {
     containerId: string,
     cmd: string[],
     env?: Record<string, string>,
-    stdin?: string
+    stdin?: string,
+    signal?: AbortSignal
   ): Promise<ExecResult>;
   stopContainer(containerId: string): Promise<void>;
   commitAll(repoPath: string, message: string): Promise<void>;
+  diffChanges(repoPath: string): Promise<string>;
 }
 
 const defaultDeps: EngineDeps = {
@@ -42,6 +58,7 @@ const defaultDeps: EngineDeps = {
   execInContainer,
   stopContainer,
   commitAll,
+  diffChanges,
 };
 
 export interface EngineOptions {
@@ -49,11 +66,62 @@ export interface EngineOptions {
   apiKey: string;
   db: Database;
   deps?: EngineDeps;
+  /** Per-attempt wall-clock timeout; defaults to {@link ATTEMPT_TIMEOUT_MS} (overridable for tests). */
+  attemptTimeoutMs?: number;
+}
+
+/**
+ * Run one harness attempt under a wall-clock timeout. If the harness hasn't
+ * settled by `timeoutMs`, the exec is aborted (killed) and the attempt is
+ * classified as a `harness_error` rather than hanging the task forever.
+ */
+async function runAttempt(
+  containerId: string,
+  prompt: string,
+  apiKey: string,
+  timeoutMs: number,
+  deps: EngineDeps
+): Promise<FinalResult> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const timeout = new Promise<FinalResult>(resolve => {
+    timer = setTimeout(() => {
+      controller.abort();
+      resolve({ status: 'harness_error', summary: `attempt timed out after ${timeoutMs}ms` });
+    }, timeoutMs);
+  });
+
+  try {
+    const run = runPiHarness(
+      containerId,
+      prompt,
+      apiKey,
+      (cid, cmd, env, stdin, signal) => deps.execInContainer(cid, cmd, env, stdin, signal),
+      controller.signal
+    );
+    return await Promise.race([run, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** Read the agent's handoff fragment if present, otherwise `undefined`. */
+async function readFragment(containerId: string, deps: EngineDeps): Promise<string | undefined> {
+  const res = await deps.execInContainer(containerId, ['cat', FRAGMENT_PATH]);
+  if (res.exitCode !== 0) return undefined;
+  return res.stdout.trim() ? res.stdout : undefined;
+}
+
+/** Clear the handoff fragment so a stale one can't leak into a later attempt. */
+async function clearFragment(containerId: string, deps: EngineDeps): Promise<void> {
+  await deps.execInContainer(containerId, ['rm', '-f', FRAGMENT_PATH]);
 }
 
 export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void> {
   const { repoPath, apiKey, db } = opts;
   const deps = opts.deps ?? defaultDeps;
+  const attemptTimeoutMs = opts.attemptTimeoutMs ?? ATTEMPT_TIMEOUT_MS;
   const taskRepo = new TaskRepository(db);
   const subtaskRepo = new SubtaskRepository(db);
 
@@ -118,40 +186,77 @@ export async function runTask(task: TaskSpec, opts: EngineOptions): Promise<void
       const subtask = bodyBySlug.get(runnable[0])!;
       const subtaskId = subtaskRepo.findId(taskId, subtask.slug);
 
-      subtaskRepo.setStatus(subtaskId, 'running');
-      subtaskRepo.incrementAttempts(subtaskId);
+      // Attempt loop: the first attempt runs the subtask body; each retry runs a
+      // fresh harness over the partial changes still on disk (fix-forward), fed a
+      // prompt assembled from the failure. After K attempts the subtask escalates.
+      let prompt = subtask.body;
+      let passed = false;
 
-      const finalResult = await runPiHarness(
-        containerId,
-        subtask.body,
-        apiKey,
-        (cid, cmd, env, stdin) => deps.execInContainer(cid, cmd, env, stdin)
-      );
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        subtaskRepo.setStatus(subtaskId, 'running');
+        subtaskRepo.incrementAttempts(subtaskId);
 
-      if (finalResult.status !== 'passed') {
-        subtaskRepo.setStatus(subtaskId, finalResult.status);
-        console.log(`  [${subtask.slug}] ${finalResult.status}: ${finalResult.summary}`);
-        halted = true;
-        continue; // re-loop once to cascade `blocked` onto this subtask's dependents
+        const harnessResult = await runAttempt(containerId, prompt, apiKey, attemptTimeoutMs, deps);
+
+        // Classify the attempt. A harness crash/timeout short-circuits; otherwise
+        // the verify is authoritative — a self-reported success never overrides a
+        // red verify.
+        let outcome: FinalStatus;
+        let verifyOutput = '';
+        if (harnessResult.status === 'harness_error') {
+          outcome = 'harness_error';
+          verifyOutput = harnessResult.summary;
+        } else {
+          const verifyResult = await deps.execInContainer(containerId, ['sh', '-c', subtask.verify]);
+          if (verifyResult.exitCode === 0) {
+            outcome = 'passed';
+          } else {
+            outcome = 'verify_failed';
+            verifyOutput = [verifyResult.stdout, verifyResult.stderr].filter(Boolean).join('\n');
+          }
+        }
+
+        if (outcome === 'passed') {
+          // One commit per passing subtask. The message encodes task + subtask
+          // slug so the branch history is self-describing and the engine can
+          // later recognize its own checkpoints.
+          await deps.commitAll(repoPath, `${task.slug}(${subtask.slug}): passed`);
+          subtaskRepo.setStatus(subtaskId, 'passed');
+          console.log(`  [${subtask.slug}] passed (attempt ${attempt}/${MAX_ATTEMPTS})`);
+          passed = true;
+          break;
+        }
+
+        subtaskRepo.setStatus(subtaskId, outcome);
+        console.log(`  [${subtask.slug}] ${outcome} (attempt ${attempt}/${MAX_ATTEMPTS})`);
+        if (verifyOutput) console.log(verifyOutput);
+
+        // Fold any handoff fragment into the next attempt, then clear it so it
+        // can't leak forward stale.
+        const fragment = await readFragment(containerId, deps);
+        await clearFragment(containerId, deps);
+
+        if (attempt < MAX_ATTEMPTS) {
+          const diff = await deps.diffChanges(repoPath);
+          prompt = assembleRetryPrompt({
+            body: subtask.body,
+            attempt: attempt + 1,
+            maxAttempts: MAX_ATTEMPTS,
+            verifyOutput,
+            diff,
+            fragment,
+          });
+        }
       }
 
-      const verifyResult = await deps.execInContainer(containerId, ['sh', '-c', subtask.verify]);
-
-      if (verifyResult.exitCode !== 0) {
-        subtaskRepo.setStatus(subtaskId, 'verify_failed');
-        console.log(`  [${subtask.slug}] verify_failed`);
-        if (verifyResult.stdout) console.log(verifyResult.stdout);
-        if (verifyResult.stderr) console.log(verifyResult.stderr);
+      if (!passed) {
+        // K attempts exhausted: escalate and halt the task. Re-loop once so the
+        // cascade marks this subtask's dependents `blocked`.
+        subtaskRepo.setStatus(subtaskId, 'needs_human');
+        console.log(`  [${subtask.slug}] needs_human after ${MAX_ATTEMPTS} attempts`);
         halted = true;
-        continue; // re-loop once to cascade `blocked` onto this subtask's dependents
+        continue;
       }
-
-      // One commit per passing subtask. The message encodes task + subtask slug
-      // so the branch history is self-describing and the engine can later
-      // recognize its own checkpoints.
-      await deps.commitAll(repoPath, `${task.slug}(${subtask.slug}): passed`);
-      subtaskRepo.setStatus(subtaskId, 'passed');
-      console.log(`  [${subtask.slug}] passed`);
     }
   } finally {
     await deps.stopContainer(containerId);
